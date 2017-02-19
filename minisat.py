@@ -1,5 +1,8 @@
 import os
 import time
+
+import cProfile
+
 # From http://minisat.se/downloads/MiniSat.pdf
 
 # Positive literals given by 2x 
@@ -30,6 +33,9 @@ LitFalse = -1
 class VarOrder(object):
     """Returns unassigned variable with highest activity"""
 
+    # TODO
+    # switch to using priority queue (https://docs.python.org/2/library/heapq.html#priority-queue-implementation-notes)
+
     def __init__(self,solver):
         self.solver = solver
 
@@ -40,9 +46,9 @@ class VarOrder(object):
     def update(self,x):
         """Called when a variable has been increased in activity"""
         pass # TODO
-        
+
     def updateAll(self):
-        """Called when all variables have been assigned activities"""
+        """Called when all activities have been modified"""
         pass # TODO
         
     def undo(self,x):
@@ -66,7 +72,6 @@ class Solver(object):
         self.cla_decay = 0.9 # Decay factor for clause activity
         self.activity = [] # Variable activity
         self.watches = [] # Map literal ->list of constraints
-        self.undos = [] # Map variable -> list of constraints to update
         self.propQ = set() # Propagation queue
         self.assigns = [] #List of current assignments
         self.trail = [] # List of assignments in chronological order
@@ -102,7 +107,6 @@ class Solver(object):
 
         self.watches.append([])
         self.watches.append([])
-        self.undos.append([])
         self.reason.append(None)
         self.assigns.append(LitUndefined)
         self.level.append(-1)
@@ -112,10 +116,9 @@ class Solver(object):
 
     def addClause(self,literals):
         """Returns False if contradiction detected, or True if added"""
-        out_clause=[None]
-        r=make_clause(self,literals,False,out_clause)
-        if out_clause[0]:
-            self.constrs.append(out_clause[0])
+        r,out_clause=make_clause(self,literals,False)
+        if out_clause:
+            self.constrs.append(out_clause)
         return r
 
     def propagate(self):
@@ -130,9 +133,7 @@ class Solver(object):
                 if not cl.propagate(self,litp):
                     # Constraint is conflicting
                     # Copy remaining watches and return constraint
-                    # TODO can this just be a slice operation?
-                    for j in range(i+1,len(tmp)):
-                        self.watches[litp].append(tmp[j])
+                    self.watches[litp].extend(tmp[i+1:])
                     self.propQ=set()
                     return cl
 
@@ -153,19 +154,20 @@ class Solver(object):
         #print 'trail',len(self.trail)
         return True
 
-    def analyze(self,confl, out_learnt, out_btlevel):
+    def analyze(self,confl):
         """Analyze a conflict clause and produce a reason clause.
-        Undos part of the trail, not beyond the last decision level"""
-        #TODO change out_learnt, out_btlevel to return argument
+
+        Undos part of the trail, not beyond the last decision level.
+        Returns reason clause, backtrack level
+        """
         seen=set()
         counter=0
         litp=LitUndefined
         p_reason=[]
-        out_learnt.append(None) # Leave room for the asserting literal
-        out_btlevel[0] = 0
+        out_learnt=[None] # Leave room for the asserting literal
+        out_btlevel = 0
         while 1:
-            p_reason = []
-            confl.calcReason(self,litp,p_reason)
+            p_reason = confl.calcReason(self,litp)
 
             # Trace reason for p
             for litq in p_reason:
@@ -176,7 +178,7 @@ class Solver(object):
                         counter+=1
                     elif self.level[v] > 0: # Exclude variables from decision level 0
                         out_learnt.append(litq^1)
-                        out_btlevel[0] = max(out_btlevel[0],self.level[v])
+                        out_btlevel = max(out_btlevel,self.level[v])
 
             # Select next literal to look at
             while 1:
@@ -189,12 +191,12 @@ class Solver(object):
             if counter<=0:
                 break
         out_learnt[0] = litp^1
+        return out_learnt, out_btlevel
 
     def record(self,ps):
         """Record a clause and drive backtracking"""
-        out_clause = [None] # TODO change to return two things?
-        assert make_clause(self,ps,True,out_clause) # Cannot fail here
-        c = out_clause[0]
+        r,c = make_clause(self,ps,True)
+        assert r # Cannot fail here
         assert self.enqueue(ps[0],c) # cannot fail here
         if c is not None:
             self.learnts.append(c)
@@ -202,16 +204,11 @@ class Solver(object):
     def undoOne(self):
         """Unbinds the last variable on the trail"""
         litp = self.trail.pop()
-        #print 'Undo',litp
         x = var(litp)
         self.assigns[x] = LitUndefined
         self.reason[x] = None
         self.level[x] = -1
         self.order.undo(x)
-        while self.undos[x]:
-            self.undos[x][-1].undo(self,litp)
-            self.undos[x].pop() # TODO can this be done in one line?
-            # TODO is a loop over self.undos[x] safe?
 
     def assume(self,litp):
         """Returns FALSE if immediate conflict"""
@@ -220,17 +217,11 @@ class Solver(object):
 
     def cancel(self):
         """Revert to state before last push"""
-        c = len(self.trail) - self.trail_lim[-1]
-        #print 'cancel',c,self.trail_lim[-1]
-        while c:
+        for c in range( len(self.trail) - self.trail_lim.pop() ):
             self.undoOne()
-            c-=1
-        #print 'Reducing trail_lim'
-        self.trail_lim.pop()
 
     def cancelUntil(self,level):
         """Cancels several levels of assumptions"""
-        #print 'CancelUntil',level
         while self.decisionLevel() > level:
             self.cancel()
 
@@ -250,26 +241,24 @@ class Solver(object):
         conflictC = 0
         var_decay = 1. / var_decay
         cla_decay = 1. / cla_decay
-        self.var_inc = 1. # TODO check this
-        self.cla_inc = 1. # TODO check this
+        self.var_inc = 1.
+        self.cla_inc = 1.
         self.model=[]
         while 1:
             confl = self.propagate()
             if confl:
-                #print 'conflict'
                 # Conflict
                 conflictC += 1
                 learnt_clause = []
                 backtrack_level=[None]
                 if self.decisionLevel() == self.root_level:
                     return LitFalse
-                self.analyze(confl,learnt_clause,backtrack_level)
-                self.cancelUntil(max(backtrack_level[0],self.root_level))
+                learnt_clause,backtrack_level = self.analyze(confl)
+                self.cancelUntil(max(backtrack_level,self.root_level))
                 self.record(learnt_clause)
                 self.decayActivities()
             else:
                 # No conflict
-                #print 'no conflict'
                 if self.decisionLevel()==0:
                     assert self.simplifyDB() # Cannot return false here
                 if len(self.learnts)-self.nAssigns() >= nof_learnts:
@@ -303,11 +292,12 @@ class Solver(object):
     def varRescaleActivity(self):
         self.activity = [a*1e-100 for a in self.activity]
         self.var_inc *= 1e-100
+        self.order.updateAll()
 
     def claBumpActivity(self,c):
         c.activity += self.cla_inc
         if c.activity>1e100:
-            self.claRescaleActivit()
+            self.claRescaleActivity()
 
     def varDecayActivity(self):
         self.cla_inc *= self.cla_decay
@@ -371,30 +361,32 @@ class Solver(object):
         return status == LitTrue
     
 
-def make_clause(S,ps,learnt,out_clause):
-    """Returns the new clause in out_clause[0], or None i already satisfied.
+def make_clause(S,ps,learnt):
+    """Constructs a new clause based on array of literals in ps.
 
-    learnt clauses are oned discovered by the model.
+    learnt clauses are ones discovered by the model.
         All literals will be false except first.
         
-    Returns False if model is inconsistent"""
-    #print 'make_clause',ps
-    out_clause[0] = None
+    Returns False,None if model is inconsistent
+    Returns False,out_clause if model is still consistent
+
+    out_clause can be None if already satisfied.
+    """
     if not learnt:
         # Normalize clause
         W=set(p for p in ps if S.value_lit(p)!=LitFalse) # Remove False literals
         for p in W: # Remove duplicates and true clauses
             if S.value_lit(p)==LitTrue:
                 #print 'Always true clause',p,S.assigns[var(p)],S.value_lit(p)
-                return True
+                return True,None
             if p^1 in W:
                 #print 'Contains p and not p'
-                return True
+                return True,None
         ps=list(W)
     if len(ps)==0:
-        return False
+        return False,None
     if len(ps)==1:
-        return S.enqueue(ps[0])
+        return S.enqueue(ps[0]),None
     c = Clause(ps,learnt)
     if learnt:
         # Pick a second literal to watch
@@ -403,12 +395,10 @@ def make_clause(S,ps,learnt,out_clause):
         ps[1],ps[max_i]=ps[max_i],ps[1]
         S.claBumpActivity(c) # Newly learnt clauses considered active
         for lit in ps:
-            S.varBumpActivity(var(lit)) # Variables in conflict clauses are bumped
-    #print 'Clause',ps    
+            S.varBumpActivity(var(lit)) # Variables in conflict clauses are bumped   
     S.watches[ps[0]^1].append(c)
     S.watches[ps[1]^1].append(c)
-    out_clause[0] = c
-    return True
+    return True, c
 
     
 class Clause(object):
@@ -429,7 +419,9 @@ class Clause(object):
         self.removeElem(S.watches[index(self.lits[1]^1)])
 
     def simplify(self,S):
-        """Simplify this constraint - False vars can be ignored, True ones can remove whole clause"""
+        """Simplify this constraint - False vars can be ignored, True vars can remove whole clause.
+
+        Returns true if whole clause can be ignored."""
         j = 0
         L=self.lits
         for lit in L:
@@ -448,35 +440,41 @@ class Clause(object):
         Ask this constraint whether more unit info can be inferred.
         If so, it is added to the queue"""
         # Make sure false literal is lits[1]
+        A=S.assigns
         L=self.lits
         if L[0] == litp^1:
             L[0] = L[1]
             L[1] = litp^1
         # If watch is true, clause is satisfied
-        if S.value_lit(L[0])==LitTrue:
+        #if S.value_lit(L[0])==LitTrue:
+        if A[L[0]>>1] == 1-2*(L[0]&1):
             S.watches[litp].append(self)
             return True
 
         # Look for a new literal to watch
-        for i in range(2,len(L)):
-            if S.value_lit(L[i]) != LitFalse:
+        i=2
+        while i<len(L):
+            #if S.value_lit(L[i]) != LitFalse:
+            l=L[i]
+            f=-1+2*(l&1)
+            if A[l>>1] != f:
                 L[1] = L[i]
                 L[i] = litp^1
                 S.watches[L[1]^1].append(self)
                 return True
+            i+=1
 
         # Clause is unit under assignment
         S.watches[litp].append(self)
         return S.enqueue(L[0],self)  # Enqueue for more propagation
 
-    def calcReason(self,S,litp,out_reason):
+    def calcReason(self,S,litp):
+        """Returns vector of literals representing reason for inconsistency"""
         # Invariant, litp==LitUndefined or p==lits[0]
         start = 0 if (litp==LitUndefined) else 1
-        L=self.lits
-        for i in range(start,len(L)):
-            out_reason.append(L[i]^1) # invariant: S.value(lits{i]) == LitFalse
         if self.learnt:
             S.claBumpActivity(self)
+        return [lit^1 for lit in self.lits[start:]]
 
 
 def load_dimacs(fname):
@@ -508,7 +506,6 @@ def load_dimacs(fname):
 def test_aim():
     """Runs throught the AIM DIMACS examples and checks correctness"""
     dirname = "aim"
-    #dirname = "mytests"
     for fname in os.listdir(dirname):
         if 'cnf' in fname:
             print fname,
@@ -520,6 +517,8 @@ def test_aim():
             assert v==('yes' in fname)
 
 t0=time.time()
+#cProfile.run("test_aim()")
 test_aim()
 print time.time()-t0
 
+# 8 seconds with cProfile
